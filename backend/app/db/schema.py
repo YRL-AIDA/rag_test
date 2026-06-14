@@ -20,10 +20,18 @@ DbSession = Annotated[Session, Depends(get_db)]
 class Base(DeclarativeBase):
     pass
 
+class User(Base):
+    __tablename__ = "user"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(30), index=True, unique=True)
+    password: Mapped[str] = mapped_column(String(200))
+
 class Document(Base):
     __tablename__ = "document"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("user.id"))
     name: Mapped[str]
     status: Mapped[str]
     s3_filename: Mapped[str] = mapped_column(unique=True)

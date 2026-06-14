@@ -35,12 +35,3 @@ class PyMuPdfReportJson(BaseModel):
     total_pages: int
     pages: List[PyMuPdfPage]
 
-class PyMuPdfPartialPage(BaseModel):
-    page_number: int
-    image: str
-
-class PyMuPdfPartialReportJson(BaseModel):
-    document_name: str
-    total_pages: int
-    pages: List[PyMuPdfPartialPage]
-

@@ -9,16 +9,15 @@ from app.core.ml_models import ml_models
 from app.core.s3 import S3Client
 from app.core.qdrant import QdrantClient
 from app.core.openai import OpenAIClient
-from app.services.document_service import report_search, s3_get_documents, s3_upload_document, s3_delete_document
+from app.services.document_service import s3_get_documents, s3_upload_document, s3_delete_document
 from app.services.document_service import service_points_search
 from app.services.document_service import pager_process_document as service_pager_process_document
 from app.services.document_service import pymupdf_full_process_document as service_pymupdf_full_process_document 
-from app.services.document_service import pymupdf_partial_process_document as service_pymupdf_partial_process_document
 from app.services.document_service import mineru_process_document as service_mineru_process_document
 from app.services.report_service import delete_reports
 from app.db.schema import DbSession, Document, Report
 from app.models.document_models import DocumentStatus
-from app.models.report_models import PyMuPdfPartialReportJson
+from app.services.auth_service import AuthUserData
 
 router = APIRouter(
     prefix="/document"
@@ -31,9 +30,8 @@ SUPPORTED_FILE_TYPES = {
     "application/pdf": "pdf"
 }
 
-
 @router.post("/upload")
-def upload_document(s3_client: S3Client, db: DbSession, file: UploadFile | None = None):
+def upload_document(user_data: AuthUserData, s3_client: S3Client, db: DbSession, file: UploadFile | None = None):
 
     if not file:
         logging.info(f"No provided file")
@@ -61,15 +59,14 @@ def upload_document(s3_client: S3Client, db: DbSession, file: UploadFile | None 
     
     document_uuid = uuid4()
 
-    document_id = s3_upload_document(content, str(document_uuid), SUPPORTED_FILE_TYPES[mime_type], filename, s3_client, db)
+    document_id = s3_upload_document(content, str(document_uuid), SUPPORTED_FILE_TYPES[mime_type], filename, user_data, s3_client, db)
 
     return {"message": "file uploaded successfuly", "id": document_id}
 
-
 @router.post("/delete")
-async def delete_document(id: int, qdrant_client: QdrantClient, s3_client: S3Client, db: DbSession):
+async def delete_document(id: int, user_data: AuthUserData, qdrant_client: QdrantClient, s3_client: S3Client, db: DbSession):
     document = await run_in_threadpool(lambda: db.query(Document).filter(Document.id == id).first())
-    if document is None:
+    if document is None or document.owner_id != user_data.user_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document is not found"
@@ -85,9 +82,9 @@ async def delete_document(id: int, qdrant_client: QdrantClient, s3_client: S3Cli
     return {"message": "file successfuly deleted"}
 
 @router.post("/delete_document_reports")
-async def delete_document_reports(id: int, qdrant_client: QdrantClient, s3_client: S3Client, db: DbSession):
+async def delete_document_reports(id: int, user_data: AuthUserData, qdrant_client: QdrantClient, s3_client: S3Client, db: DbSession):
     document = await run_in_threadpool(lambda: db.query(Document).filter(Document.id == id).first())
-    if document is None:
+    if document is None or document.owner_id != user_data.user_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document is not found"
@@ -106,25 +103,25 @@ async def delete_document_reports(id: int, qdrant_client: QdrantClient, s3_clien
     return {"message": "document reports successfuly deleted"}
 
 @router.get("/get")
-def get_documents(s3_client: S3Client, db: DbSession, page: int = 1, page_size: int = 20):
+def get_documents(user_data: AuthUserData, s3_client: S3Client, db: DbSession, page: int = 1, page_size: int = 20):
 
-    result = s3_get_documents(page, page_size, s3_client, db)
+    result = s3_get_documents(page, page_size, user_data, s3_client, db)
 
     return result
 
 @router.post("/pager_process")
-async def pager_process_document(id: int,  qdrant_client: QdrantClient, s3_client: S3Client,  db: DbSession):
+async def pager_process_document(id: int, user_data: AuthUserData, qdrant_client: QdrantClient, s3_client: S3Client,  db: DbSession):
     document = await run_in_threadpool(lambda: db.query(Document).filter(Document.id == id).first())
-    if document is None:
+    if document is None or document.owner_id != user_data.user_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document is not found"
         )
-    # if document.status == DocumentStatus.PROCESSING.value:
-    #     raise HTTPException(
-    #         status_code=status.HTTP_409_CONFLICT,
-    #         detail="Document is already being processed"
-    #     )
+    if document.status == DocumentStatus.PROCESSING.value:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Document is already being processed"
+        )
 
     report_id = await service_pager_process_document(document, qdrant_client, s3_client, db)
 
@@ -132,56 +129,36 @@ async def pager_process_document(id: int,  qdrant_client: QdrantClient, s3_clien
 
 
 @router.post("/pymupdf_full_process")
-async def pymupdf_full_process_document(id: int,  qdrant_client: QdrantClient, s3_client: S3Client,  db: DbSession):
+async def pymupdf_full_process_document(id: int, user_data: AuthUserData, qdrant_client: QdrantClient, s3_client: S3Client,  db: DbSession):
     document = await run_in_threadpool(lambda: db.query(Document).filter(Document.id == id).first())
-    if document is None:
+    if document is None or document.owner_id != user_data.user_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document is not found"
         )
-    # if document.status == DocumentStatus.PROCESSING.value:
-    #     raise HTTPException(
-    #         status_code=status.HTTP_409_CONFLICT,
-    #         detail="Document is already being processed"
-    #     )
+    if document.status == DocumentStatus.PROCESSING.value:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Document is already being processed"
+        )
 
     report_id = await service_pymupdf_full_process_document(document, qdrant_client, s3_client, db)
 
     return {"message": "document successfuly processed", "id": report_id}
 
-
-@router.post("/pymupdf_partial_process")
-async def pymupdf_partial_process_document(id: int, start: int, end: int, s3_client: S3Client,  db: DbSession):
-    document = await run_in_threadpool(lambda: db.query(Document).filter(Document.id == id).first())
-    if document is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document is not found"
-        )
-    # if document.status == DocumentStatus.PROCESSING.value:
-    #     raise HTTPException(
-    #         status_code=status.HTTP_409_CONFLICT,
-    #         detail="Document is already being processed"
-    #     )
-
-    report_id = await service_pymupdf_partial_process_document(document, start, end, s3_client, db)
-
-    return {"message": "document successfuly processed", "id": report_id}
-
-
 @router.post("/mineru_process")
-async def mineru_process_document(id: int, qdrant_client: QdrantClient, s3_client: S3Client,  db: DbSession):
+async def mineru_process_document(id: int, user_data: AuthUserData, qdrant_client: QdrantClient, s3_client: S3Client,  db: DbSession):
     document = await run_in_threadpool(lambda: db.query(Document).filter(Document.id == id).first())
-    if document is None:
+    if document is None or document.owner_id != user_data.user_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document is not found"
         )
-    # if document.status == DocumentStatus.PROCESSING.value:
-    #     raise HTTPException(
-    #         status_code=status.HTTP_409_CONFLICT,
-    #         detail="Document is already being processed"
-    #     )
+    if document.status == DocumentStatus.PROCESSING.value:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Document is already being processed"
+        )
 
     report_id = await service_mineru_process_document(document, qdrant_client, s3_client, db)
 
@@ -190,17 +167,31 @@ async def mineru_process_document(id: int, qdrant_client: QdrantClient, s3_clien
 # [(label, text), (text)]
 #https://huggingface.co/Qwen/Qwen2.5-7B-Instruct
 @router.get("/report_points_based_search")
-async def report_points_based_search(prompt: str, search_text: str, report_id: int, qdrant_client: QdrantClient, open_ai_client: OpenAIClient, label: str | None = None):
-
+async def report_points_based_search(prompt: str, search_text: str, report_id: int, user_data: AuthUserData, qdrant_client: QdrantClient, open_ai_client: OpenAIClient,  db: DbSession, label: str | None = None):
+    report = await run_in_threadpool(lambda: db.query(Report).filter(Report.id == report_id).first())
+    if report is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Report is not found"
+        )
+    document = await run_in_threadpool(lambda: db.query(Document).filter(Document.id == report.document_id).first())
+    if document.owner_id != user_data.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Report is not found"
+        )
+    
     result = await service_points_search(search_text, report_id, label, qdrant_client)
 
     content = [ 
         {"type": "text", "text": search_text},
     ]
 
+    evidence_items = []
     for scored_point in result.points:
         data = scored_point.payload.get("data", "")
         content.extend(data)
+        evidence_items.extend(data)
 
     messages = [
         {"role": "system", "content": prompt},
@@ -216,67 +207,4 @@ async def report_points_based_search(prompt: str, search_text: str, report_id: i
 
     result = response.choices[0].message.content
 
-    return {"message": result}
-
-@router.get("/report_based_search")
-async def report_based_search(prompt: str, search_text: str, report_id: int, s3_client: S3Client, open_ai_client: OpenAIClient, db: DbSession):
-    report = await run_in_threadpool(lambda: db.query(Report).filter(Report.id == report_id).first())
-    if report is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Report does not exist"
-        )
-    
-    result: PyMuPdfPartialReportJson = await report_search(report, s3_client)
-
-    content = [ 
-        {"type": "text", "text": search_text},
-    ]
-
-    for page in result.pages:
-        content.append({
-            "type": "image_url",
-            "image_url": {
-                "url": page.image
-            },
-        })
-
-    messages = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": content}
-    ]
-
-    # print(content)
-
-    response = await open_ai_client.chat.completions.create(
-        model=config.open_ai_model_name,
-        messages=messages,
-        temperature=0,
-        max_tokens=4096
-    )
-
-    result = response.choices[0].message.content
-
-    return {"message": result}
-
-
-@router.get("/pure_llm_search")
-async def pure_llm_search(prompt: str, search_text: str, open_ai_client: OpenAIClient):
-
-    messages = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": search_text}
-    ]
-
-    # print(prompt + "\n" + search_text)
-
-    response = await open_ai_client.chat.completions.create(
-        model=config.open_ai_model_name,
-        messages=messages,
-        temperature=0,
-        max_tokens=4096
-    )
-
-    result = response.choices[0].message.content
-
-    return {"message": result}
+    return {"result": result, "items": evidence_items}

@@ -15,6 +15,7 @@ from app.core.logging import setup_logging
 from app.core.qdrant import init_qdrant
 from app.db.schema import Base, engine
 from app.core.ml_models import ml_models
+from app.api import auth_api
 
 #https://github.com/Kludex/fastapi-tips/tree/main
 # Should rewrite model management later like here https://starlette.dev/lifespan/
@@ -63,4 +64,5 @@ app.add_middleware(
 )
 
 # Register routes
+app.include_router(auth_api.router, prefix="/api", tags=["auth"])
 app.include_router(document_api.router, prefix="/api", tags=["document"])

@@ -10,7 +10,6 @@ from PIL import Image, ImageFile
 from uuid import uuid4
 from fastapi import HTTPException, status
 from fastapi.concurrency import run_in_threadpool
-from sentence_transformers import SentenceTransformer
 from sqlalchemy.orm import Session
 import torch
 from types_boto3_s3.client import S3Client
@@ -19,23 +18,24 @@ import httpx
 from qdrant_client import models
 
 from app.core.ml_models import ml_models
-from app.db.schema import Document, Report
+from app.db.schema import Document
 from app.core.s3 import AWS_BUCKET
 from app.core.config import config
 from app.core.qdrant import collection_name
 from app.models.document_models import DocumentStatus
 from app.services.report_service import delete_reports, outline_mineru_report, outline_pager_report, s3_upload_report, s3_upload_report_outline
 from app.services.report_service import process_pager_report, process_pymupdf_full_report, process_mineru_report
-from app.models.report_models import PyMuPdfPartialPage, PyMuPdfPartialReportJson, ReportJson, PyMuPdfReportJson, PyMuPdfPage
+from app.models.report_models import ReportJson, PyMuPdfReportJson, PyMuPdfPage
 from app.models.mineru_models import MinerUReport
-from app.utility.report_utility import base64_to_pil, safe_open_image
+from app.utility.report_utility import safe_open_image
+from app.models.auth_models import UserData
 
 PRESIGNED_URLS_EXPIRATION_TIME_SECONDS = 3600 # 1 hour
 
-def s3_upload_document(content: bytes, s3_filename: str, s3_mime_type: str, filename: str, s3_client: S3Client, db: Session) -> int:
+def s3_upload_document(content: bytes, s3_filename: str, s3_mime_type: str, filename: str, user_data: UserData, s3_client: S3Client, db: Session) -> int:
     logging.info(f"Uploading file {filename}.{s3_mime_type} to s3 {s3_filename}")
     s3_client.upload_fileobj(Fileobj=BytesIO(content), Bucket=AWS_BUCKET, Key=f"documents/{s3_filename}.{s3_mime_type}")
-    document = Document(name=filename, status=DocumentStatus.UPLOADED.value, s3_filename=s3_filename, s3_mime_type=s3_mime_type)
+    document = Document(owner_id=user_data.user_id ,name=filename, status=DocumentStatus.UPLOADED.value, s3_filename=s3_filename, s3_mime_type=s3_mime_type)
     db.add(document)
     db.commit()
     return document.id
@@ -52,9 +52,9 @@ async def s3_delete_document(document: Document, qdrant_client: AsyncQdrantClien
     await run_in_threadpool(db.delete, document)
     await run_in_threadpool(db.commit)
 
-def s3_get_documents(page: int, page_size: int, s3_client: S3Client, db: Session) -> list[dict[str, str]]:
+def s3_get_documents(page: int, page_size: int, user_data: UserData, s3_client: S3Client, db: Session) -> list[dict[str, str]]:
     logging.info(f"Presigning documents urls")
-    query = db.query(Document)
+    query = db.query(Document).filter(Document.owner_id == user_data.user_id).order_by(Document.id)
 
     total_items = query.count()
 
@@ -76,7 +76,23 @@ def s3_get_documents(page: int, page_size: int, s3_client: S3Client, db: Session
             },
             ExpiresIn=PRESIGNED_URLS_EXPIRATION_TIME_SECONDS,
         )
-        result.append({"id": document.id,"key": f"{document.name}.{document.s3_mime_type}", "status": document.status, "url": url, "reports": document.reports})
+        report_list = []
+        for report in document.reports:
+            report_url = None
+            if report.tag in ["pager", "mineru"]:
+                report_url = s3_client.generate_presigned_url(
+                    ClientMethod="get_object",
+                    Params={
+                        "Bucket": AWS_BUCKET, 
+                        "Key": f"report_outlines/{report.s3_filename}.{document.s3_mime_type}",
+                        "ResponseContentType": "application/pdf",
+                        "ResponseContentDisposition": "inline"
+                    },
+                    ExpiresIn=PRESIGNED_URLS_EXPIRATION_TIME_SECONDS,
+                )
+            report_list.append({"report": report, "url": report_url})
+
+        result.append({"id": document.id,"key": f"{document.name}.{document.s3_mime_type}", "status": document.status, "url": url, "reports": report_list})
         
     return {"page": page, "page_size": page_size, "total_items": total_items, "documents": result}
 
@@ -391,83 +407,3 @@ async def service_points_search(text: str, report_id: int, label: str | None, qd
     # print()
 
     return result
-
-def get_pages_start_end(document: Document, start: int, end: int, total_pages: int, num_of_images_input: int = 30):
-    # All page ids mentioned are based on the order in the raw document.
-    # context_start_end: page start/end id of context in qa generation
-    # num_of_images_input: the number of input images, 30 images in cut-off paradigm
-    # total_pages: total pages in the raw document
-    # img_start, img_end: input page start/end id
-    raw_start_page, raw_end_page = start, end
-    raw_pages_len = raw_end_page - raw_start_page
-    img_start = max(0, raw_start_page - (num_of_images_input - raw_pages_len)//2)
-    img_end = img_start + num_of_images_input
-    if img_end >= total_pages:
-        img_end = total_pages
-        img_start = max(0, img_end - num_of_images_input)
-    logging.info(f"Document {document.id}: start  {start}, end {end}, page number {total_pages}")
-    logging.info(f"result is [{img_start}, {img_end}]")
-    return img_start, img_end
-
-async def pymupdf_partial_process_document(document: Document, start: int, end: int, s3_client: S3Client, db: Session):
-    logging.info(f"Processing document {document.s3_filename}.{document.s3_mime_type} from s3")
-    document.status = DocumentStatus.PROCESSING.value
-    await run_in_threadpool(db.commit)
-    try:
-
-        file = await run_in_threadpool(s3_client.get_object, Bucket=AWS_BUCKET, Key=f"documents/{document.s3_filename}.{document.s3_mime_type}")
-
-        file_content = await run_in_threadpool(file["Body"].read)
-
-        pymupdf_doc = pymupdf.open(stream=file_content, filetype=document.s3_mime_type)
-
-        part_start, part_end = get_pages_start_end(document, start, end, pymupdf_doc.page_count)
-
-        pages_data  = []
-        for page in pymupdf_doc.pages(start=part_start, stop=part_end):
-            pix = page.get_pixmap()
-            image_bytes = pix.tobytes("png")
-            page_data = f"data:image/png;base64,{base64.b64encode(image_bytes).decode("utf-8")}"
-            pages_data.append(PyMuPdfPartialPage(page_number=page.number, image=page_data))
-
-        report_data = PyMuPdfPartialReportJson(
-            document_name=document.s3_filename,
-            total_pages=pymupdf_doc.page_count,
-            pages=pages_data
-        )
-
-        pymupdf_doc.close()
-
-        json_bytes = report_data.model_dump_json(indent=2).encode("utf-8")
-
-        report_uuid = uuid4()
-        
-        report = await run_in_threadpool(s3_upload_report, json_bytes, "pymupdf_partial", str(report_uuid), document, s3_client, db)
-
-        document.status = DocumentStatus.PROCESSED.value
-        await run_in_threadpool(db.commit)
-
-        return report.id
-
-    except Exception as e:
-        await run_in_threadpool(db.rollback)
-        logging.exception(f"Error while processing document {document.s3_filename}.{document.s3_mime_type} from s3 \n {e}")
-        document.status = DocumentStatus.PROCESSING_FAILED.value
-        await run_in_threadpool(db.commit)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Document processing failed"
-        )
-
-async def report_search(report: Report, s3_client: S3Client) -> str:
-    logging.info(f"Assembling text for report {report.id}")
-
-    # text = text.replace("-\n", "").replace("\n", " ").lower()
-    file = await run_in_threadpool(s3_client.get_object, Bucket=AWS_BUCKET, Key=f"reports/{report.s3_filename}.json")
-
-    file_content = await run_in_threadpool(file["Body"].read)
-
-    report_obj = PyMuPdfPartialReportJson.model_validate_json(file_content)
-
-    return report_obj
-

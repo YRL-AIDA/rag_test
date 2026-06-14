@@ -5,6 +5,8 @@ load_dotenv()
 
 class Config(BaseSettings):
     app_name: str = "ScalableFastAPIProject"
+    secret_key: str = "dev_secret"
+    secure_cookie: bool = False
     frontend_origin: str = ""
     db_url: str = ""
     s3_bucket_name: str = ""
